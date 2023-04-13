@@ -18,70 +18,81 @@
 from qiskit import QuantumCircuit, QuantumRegister, ClassicalRegister
 from qiskit_aer.noise import depolarizing_error, pauli_error
 
+from qiskit_qec.utils import DecodingGraphNode
 from qiskit_qec.circuits.code_circuit import CodeCircuit
+from qiskit_qec.utils.stim_tools import noisify_circuit, get_stim_circuits, detector_error_model_to_rx_graph
+from qiskit_qec.codes import StabSubSystemCode
+from qiskit_qec.operators.pauli_list import PauliList
+from qiskit_qec.linear.symplectic import normalizer
+from qiskit_qec.exceptions import QiskitQECError
 
 import stim
-from qiskit_aer.noise.errors.quantum_error import QuantumChannelInstruction
 
 class CssCodeCircuit(CodeCircuit):
     """
     CodeCircuit class for generic CSS codes.
     """
 
-    def __init__(self, code, T, basis="z", round_schedule="zx", p_depol=0, p_meas=0):
+    def __init__(self, code, T, basis="z", round_schedule="zx", noise_model=None):
         """
         Args:
             code: A CSS code
             T: Number of syndrome measurement rounds
             basis: basis for encoding ('x' or 'z')
             round_schedule: Order in which to measureme gauge operators ('zx' or 'xz')
-            p_depol: Probabity of depolarizing noise on code qubits between rounds
-            p_meas: Probability of measurement errors
+            noise_model: Pauli noise model used in the construction of noisy circuits.
+            If a tuple, a pnenomological noise model is used with the entries being
+            probabity of depolarizing noise on code qubits between rounds and
+            probability of measurement errors, respectively.
         """
 
         super().__init__()
 
         self.code = code
+        self._get_code_properties()
         self.T = T
         self.basis = basis
         self.base = "0"
         self.round_schedule = round_schedule
-        self.p_depol = p_depol
-        self.p_meas = p_meas
-        self._noise = p_depol > 0 or p_meas > 0
+        self.noise_model = noise_model
+        self._phenom = isinstance(noise_model, tuple)
+        if self._phenom:
+            p_depol, p_meas = self.noise_model
+            self._depol_error = depolarizing_error(p_depol, 1)
+            self._meas_error = pauli_error([("X", p_meas), ("I", 1 - p_meas)])
 
-        self._depol_error = depolarizing_error(p_depol, 1)
-        self._meas_error = pauli_error([("X", p_meas), ("I", 1 - p_meas)])
-
-        self.circuit = {}
-        for state in ["0", "1"]:
+        circuit = {}
+        states = ["0", "1"]
+        if self._phenom:
+            states += ["0n", "1n"]
+        for state in states:
             qc = QuantumCircuit()
             qregs = []
             qregs.append(QuantumRegister(code.n, name="code qubits"))
-            qregs.append(QuantumRegister(len(code.z_gauges), name="z auxs"))
-            qregs.append(QuantumRegister(len(code.x_gauges), name="x auxs"))
+            qregs.append(QuantumRegister(len(self.z_gauges), name="z auxs"))
+            qregs.append(QuantumRegister(len(self.x_gauges), name="x auxs"))
             for qreg in qregs:
                 qc.add_register(qreg)
             # prepare initial state
-            if state == "1":
+            if state[0] == "1":
                 if basis == "z":
-                    qc.x(code.logical_x[0])
+                    qc.x(self.logical_x[0])
                 else:
-                    qc.x(code.logical_z[0])
+                    qc.x(self.logical_z[0])
             if basis == "x":
                 qc.h(qregs[0])
             # peform syndrome measurements
             for t in range(T):
-                if self._noise:
+                if state[-1] == "n" and self._phenom:
                     for q in qregs[0]:
                         qc.append(self._depol_error, [q])
                 # gauge measurements
                 if round_schedule == "zx":
-                    self._z_gauge_measurements(qc, t)
-                    self._x_gauge_measurements(qc, t)
+                    self._z_gauge_measurements(qc, t, state)
+                    self._x_gauge_measurements(qc, t, state)
                 elif round_schedule == "xz":
-                    self._x_gauge_measurements(qc, t)
-                    self._z_gauge_measurements(qc, t)
+                    self._x_gauge_measurements(qc, t, state)
+                    self._z_gauge_measurements(qc, t, state)
                 else:
                     print("Round schedule " + round_schedule + " not supported.")
             # final readout
@@ -89,15 +100,26 @@ class CssCodeCircuit(CodeCircuit):
             qc.add_register(creg)
             if basis == "x":
                 qc.h(qregs[0])
-            if self._noise:
+            if state[-1] == "n" and self._phenom:
                 for q in qregs[0]:
                     qc.append(self._meas_error, [q])
             qc.measure(qregs[0], creg)
-            self.circuit[state] = qc
+            circuit[state] = qc
+
+        self.circuit = {}
+        self.noisy_circuit = {}
+        for state, qc in circuit.items():
+            if state[-1] == "n" and self._phenom:
+                self.noisy_circuit[state[0]] = qc
+            else:
+                self.circuit[state] = qc
+        if noise_model and not self._phenom:
+            for state, qc in circuit.items():
+                self.noisy_circuit[state] = noisify_circuit(qc, noise_model)
 
         self._gauges4stabilizers = []
-        self._stabilizers = [code.x_stabilizers, code.z_stabilizers]
-        self._gauges = [code.x_gauges, code.z_gauges]
+        self._stabilizers = [self.x_stabilizers, self.z_stabilizers]
+        self._gauges = [self.x_gauges, self.z_gauges]
         for j in range(2):
             self._gauges4stabilizers.append([])
             for stabilizer in self._stabilizers[j]:
@@ -107,26 +129,82 @@ class CssCodeCircuit(CodeCircuit):
                         gauges.append(g)
                 self._gauges4stabilizers[j].append(gauges)
 
-    def _z_gauge_measurements(self, qc, t):
-        creg = ClassicalRegister(len(self.code.z_gauges), name="round_" + str(t) + "_z_bits")
+    def _get_code_properties(self):
+
+        if isinstance(self.code, StabSubSystemCode):
+
+            is_css = True
+
+            raw_gauges = self.code.gauge_group.generators
+            center, log, conj_log = normalizer(self.code.generators.matrix)
+            raw_stabilizers = PauliList(center)
+            raw_logicals = PauliList(log) + PauliList(conj_log)
+
+            gauges = [[], []]
+            stabilizers = [[], []]
+            logicals = [[], []]
+
+            for (
+                raw_ops,
+                ops,
+            ) in zip([raw_gauges, raw_stabilizers, raw_logicals], [gauges, stabilizers, logicals]):
+
+                for op in raw_ops:
+                    op = str(op)
+                    for j, pauli in enumerate(["X", "Z"]):
+                        if (op.count(pauli) + op.count("I")) == self.code.n:
+                            ops[j].append([k for k, p in enumerate(op[::-1]) if p == pauli])
+                is_css = is_css and (len(ops[0]) + len(ops[1])) == len(raw_ops)
+
+            # extra stabilizers: the product of all others
+            for j in range(2):
+                combined = []
+                for stabilizer in stabilizers[j]:
+                    combined += stabilizer
+                stabilizers[j].append([])
+                for q in combined:
+                    if combined.count(q) % 2:
+                        stabilizers[j][-1].append(q)
+
+            if is_css:
+                self.x_gauges = gauges[0]
+                self.z_gauges = gauges[1]
+                self.x_stabilizers = stabilizers[0]
+                self.z_stabilizers = stabilizers[1]
+                self.logical_x = logicals[0]
+                self.logical_z = logicals[1]
+            else:
+                raise QiskitQECError("Code is not obviously CSS.")
+
+        else:
+            # otherwise assume it has the info
+            self.x_gauges = self.code.x_gauges
+            self.z_gauges = self.code.z_gauges
+            self.x_stabilizers = self.code.x_stabilizers
+            self.z_stabilizers = self.code.z_stabilizers
+            self.logical_x = self.code.logical_x
+            self.logical_z = self.code.logical_z
+
+    def _z_gauge_measurements(self, qc, t, state):
+        creg = ClassicalRegister(len(self.z_gauges), name="round_" + str(t) + "_z_bits")
         qc.add_register(creg)
-        for g, z_gauge in enumerate(self.code.z_gauges):
+        for g, z_gauge in enumerate(self.z_gauges):
             for q in z_gauge:
                 qc.cx(qc.qregs[0][q], qc.qregs[1][g])
-            if self._noise:
+            if state[-1] == "n" and self._phenom:
                 qc.append(self._meas_error, [qc.qregs[1][g]])
             qc.measure(qc.qregs[1][g], creg[g])
             qc.reset(qc.qregs[1][g])
 
-    def _x_gauge_measurements(self, qc, t):
-        creg = ClassicalRegister(len(self.code.x_gauges), name="round_" + str(t) + "_x_bits")
+    def _x_gauge_measurements(self, qc, t, state):
+        creg = ClassicalRegister(len(self.x_gauges), name="round_" + str(t) + "_x_bits")
         qc.add_register(creg)
-        for g, x_gauge in enumerate(self.code.x_gauges):
+        for g, x_gauge in enumerate(self.x_gauges):
             for q in x_gauge:
                 qc.h(qc.qregs[0][q])
                 qc.cx(qc.qregs[0][q], qc.qregs[2][g])
                 qc.h(qc.qregs[0][q])
-            if self._noise:
+            if state[-1] == "n" and self._phenom:
                 qc.append(self._meas_error, [qc.qregs[2][g]])
             qc.measure(qc.qregs[2][g], creg[g])
             qc.reset(qc.qregs[2][g])
@@ -138,7 +216,16 @@ class CssCodeCircuit(CodeCircuit):
         Args:
             string (string): Results string to convert.
             kwargs (dict): Any additional keyword arguments.
+                logical (str): Logical value whose results are used ('0' as default).
+                all_logicals (bool): Whether to include logical nodes
+                irrespective of value. (False as default).
         """
+
+        all_logicals = kwargs.get("all_logicals")
+        logical = kwargs.get("logical")
+        if logical is None:
+            logical = "0"
+
         output = string.split(" ")[::-1]
         gauge_outs = [[], []]
         for t in range(self.T):
@@ -165,14 +252,21 @@ class CssCodeCircuit(CodeCircuit):
 
         bases = ["x", "z"]
         j = bases.index(self.basis)
-        round_outs = []
-        for stabilizer in self._stabilizers[j]:
+        final_gauges = []
+        for gauge in self._gauges[j]:
             out = 0
-            for q in stabilizer:
-                out += final_outs[q]
+            for q in gauge:
+                out += final_outs[-q - 1]
             out = out % 2
-            round_outs.append(out)
-        stabilizer_outs[j].append(round_outs)
+            final_gauges.append(out)
+        final_stabilizers = []
+        for gs in self._gauges4stabilizers[j]:
+            out = 0
+            for g in gs:
+                out += final_gauges[g]
+            out = out % 2
+            final_stabilizers.append(out)
+        stabilizer_outs[j].append(final_stabilizers)
 
         stabilizer_changes = []
         for j in range(2):
@@ -192,126 +286,115 @@ class CssCodeCircuit(CodeCircuit):
             for t, round_changes in enumerate(stabilizer_changes[j]):
                 for e, change in enumerate(round_changes):
                     if change == 1:
-                        node = {
-                            "time": t,
-                            "basis": bases[j],
-                            "qubits": self._stabilizers[j][e],
-                            "element": e,
-                            "is_boundary": False,
-                        }
+                        node = DecodingGraphNode(time=t, qubits=self._stabilizers[j][e], index=e)
+                        node.properties["basis"] = bases[j]
                         nodes.append(node)
 
-        j = bases.index(self.basis)
-        boundary = [self.code.x_boundary, self.code.z_boundary]
-        boundary_qubits = [q[0] for q in boundary[j]]
+        if self.basis == "x":
+            logicals = self.logical_x
+        else:
+            logicals = self.logical_z
 
-        boundary_out = 0
-        for q in boundary_qubits:
-            boundary_out += final_outs[q]
-        boundary_out = boundary_out % 2
+        for index, logical_op in enumerate(logicals):
+            logical_out = 0
+            for q in logical_op:
+                logical_out += final_outs[-q - 1]
+            logical_out = logical_out % 2
 
-        if boundary_out == 1:
-            node = {
-                "time": 0,
-                "basis": self.basis,
-                "qubits": boundary_qubits,
-                "element": 0,
-                "is_boundary": True,
-            }
-            nodes.append(node)
+            if all_logicals or str(logical_out) != logical:
+                node = DecodingGraphNode(
+                    is_boundary=True,
+                    qubits=logical,
+                    index=index,
+                )
+                node.properties["basis"] = self.basis
+                nodes.append(node)
 
         return nodes
+
+    def check_nodes(self, nodes, ignore_extra_boundary=False):
+        pass
+
+    def is_cluster_neutral(self, atypical_nodes):
+        pass
     
-    def to_stim_circuit(self):
-        '''Returns a list of dictionaries. The first one contains the stim circuits for the two logicals,
-           the second contatins the data how the stim measurement outcomes are ordered
-        '''
-        stim_circuits = {}
-        stim_measurement_data = {}
-        for circ_label, circuit in self.circuit.items():
-            stim_circuit = stim.Circuit()
-
-            '''Dictionaries are not complete. For the stim definitions see: 
-               https://github.com/quantumlib/Stim/blob/main/doc/gates.md
-            ''' 
-            qiskit_to_stim_dict = {'id':'I','x':'X','y':'Y','z':'Z','h':'H','s':'S','sdg':'S_DAG',
-                                'cx':'CNOT','cy':'CY','cz':'CZ','swap':'SWAP',
-                                'reset':'R','measure':'M','barrier':'TICK'}
-            pauli_error_1_stim_order = {'id':0,'I':0,'X':1,'x':1,'Y':2,'y':2,'Z':3,'z':3}
-            pauli_error_2_stim_order = {'II':0,'IX':1,'IY':2,'IZ':3,
-                                        'XI':4,'XX':5,'XY':6,'XZ':7,
-                                        'YI':8,'YX':9,'YY':10,'YZ':11,
-                                        'ZI':12,'ZX':13,'ZY':14,'ZZ':15} 
-
-            measurement_data = []
-            register_offset = {}
-            previous_offset = 0
-            for inst, qargs, cargs in circuit.data:
-                for qubit in qargs:
-                    if qubit._register.name not in register_offset:
-                        register_offset[qubit._register.name] = previous_offset
-                        previous_offset += qubit._register.size
-
-                qubit_indices = [qargs[i]._index+register_offset[qargs[i]._register.name] for i in range(len(qargs))]
-
-                if isinstance(inst, QuantumChannelInstruction):
-                    '''Errors: it would be good to add exeptions for delpoarizinng noise, Z error etc,
-                    because the stim detctor error model relies on the disjoint error assumption 
-                    for general Pauli channel
-                    '''
-                    qerror = inst._quantum_error
-                    pauli_errors_types=qerror.to_dict()['instructions']
-                    pauli_probs = qerror.to_dict()['probabilities']
-                    if pauli_errors_types[0][0]['name'] in pauli_error_1_stim_order.keys():
-                        probs = 4*[0.]
-                        for pind,ptype in enumerate(pauli_errors_types):
-                            probs[pauli_error_1_stim_order[ptype[0]['name']]] = pauli_probs[pind]
-                        stim_circuit.append("PAULI_CHANNEL_1",qubit_indices,probs[1:])
-                    elif pauli_errors_types[0][0]['params'][0] in pauli_error_2_stim_order.keys(): 
-                        #here the name is always 'pauli' and the params gives the Pauli type
-                        probs = 16*[0.]
-                        for pind,ptype in enumerate(pauli_errors_types):
-                            probs[pauli_error_2_stim_order[ptype[0]['params'][0]]] = pauli_probs[pind]
-                        stim_circuit.append("PAULI_CHANNEL_2",qubit_indices,probs[1:])
-                    else:
-                        error_types = qerror.to_dict()['instructions']
-                        print("I didn't see this comming: "+str([inst, qargs, cargs]))+str(qerror)
-                else:
-                    '''Gates and measurements'''
-                    if inst.name in qiskit_to_stim_dict:
-                        if len(cargs)>0: #keeping track of measurement indices in stim
-                            measurement_data.append([cargs[0]._index+register_offset[qargs[0]._register.name],qargs[0]._register.name])
-                        if qiskit_to_stim_dict[inst.name] == "TICK": #barrier
-                            stim_circuit.append("TICK")
-                        else: #gates/measurements acting on qubits
-                            stim_circuit.append(qiskit_to_stim_dict[inst.name],qubit_indices)
-                    else: 
-                        print("I didn't see this comming: "+str([inst, qargs, cargs]))
-
-            stim_circuits[circ_label] = stim_circuit
-            stim_measurement_data[circ_label] = measurement_data
-        return [stim_circuits, stim_measurement_data]
-    
-    def get_counts_via_stim(self, logical: str = '0', shots: int = 1024):
-        '''Returns a qiskit compatible dictionary of measurement outcomes'''
-        stim_circuits, stim_measurement_data = self.to_stim_circuit()
-        stim_circuit = stim_circuits[logical]
-        measurement_data = stim_measurement_data[logical]
-
-        stim_samples = stim_circuit.compile_sampler().sample(shots=shots)
-        qiskit_counts = {}
-        for stim_sample in stim_samples:
-            prev_reg = measurement_data[-1][1]
-            qiskit_count = ''
-            for idx,meas in enumerate(measurement_data[::-1]):
-                measind,reg = meas
-                if reg != prev_reg:
-                    qiskit_count += ' '
-                qiskit_count += str(int(stim_sample[-idx-1]))
-                prev_reg = reg
-            if qiskit_count in qiskit_counts.keys():
-                qiskit_counts[qiskit_count] = qiskit_counts[qiskit_count]+1
-            else:
-                qiskit_counts[qiskit_count] = 1
+    def stim_circuit_with_detectors(self):
+        stim_circuits, _ = get_stim_circuits(self.noisy_circuit)
+        measurements_per_cycle = len(self.x_gauges)+len(self.z_gauges)
         
-        return qiskit_counts
+        if self.round_schedule[0] == 'x':
+            measurement_round_offset = [0,len(self.x_gauges)]
+        else:
+            measurement_round_offset = [len(self.z_gauges),0]
+
+        ## 0th round of measurements
+        if self.basis == 'x':
+            for stabind,stabilizer in enumerate(self.x_stabilizers):
+                record_targets = []
+                for gauge_ind in self._gauges4stabilizers[0][stabind]:
+                    record_targets.append(stim.target_rec(measurement_round_offset[0]+gauge_ind-(self.T*measurements_per_cycle + self.code.n)))
+                qubits_and_time = stabilizer.copy()
+                qubits_and_time.extend([0])
+                stim_circuits['0'].append("DETECTOR", record_targets, qubits_and_time)
+                stim_circuits['1'].append("DETECTOR", record_targets, qubits_and_time)
+        else:
+            for stabind,stabilizer in enumerate(self.z_stabilizers):
+                record_targets = []
+                for gauge_ind in self._gauges4stabilizers[1][stabind]:
+                    record_targets.append(stim.target_rec(measurement_round_offset[1]+gauge_ind-(self.T*measurements_per_cycle + self.code.n)))
+                qubits_and_time = stabilizer.copy()
+                qubits_and_time.extend([0])
+                stim_circuits['0'].append("DETECTOR", record_targets, qubits_and_time)
+                stim_circuits['1'].append("DETECTOR", record_targets, qubits_and_time)
+
+        #adding first x and then z stabilizer comparisons
+        for j in range(2):
+            circuit = stim.Circuit()
+            for t in range(1,self.T): #compare stabilizer measurements with previous in each round
+                for gind,gs in enumerate(self._gauges4stabilizers[j]):
+                    record_targets = []
+                    for gauge_ind in gs:
+                        record_targets.append(stim.target_rec(t*measurements_per_cycle+measurement_round_offset[j]+gauge_ind-(self.T*measurements_per_cycle + self.code.n)))
+                        record_targets.append(stim.target_rec((t-1)*measurements_per_cycle+measurement_round_offset[j]+gauge_ind-(self.T*measurements_per_cycle + self.code.n)))
+                    qubits_and_time = self._stabilizers[j][gind].copy()
+                    qubits_and_time.extend([t])
+                    circuit.append("DETECTOR", record_targets, qubits_and_time)
+            stim_circuits['0'] += circuit
+            stim_circuits['1'] += circuit
+        
+        ## final measurements        
+        if self.basis == 'x':
+            for stabind,stabilizer in enumerate(self.x_stabilizers):
+                record_targets = []
+                for q in stabilizer:
+                    record_targets.append(stim.target_rec(q - self.code.n))
+                for gauge_ind in self._gauges4stabilizers[0][stabind]:
+                    record_targets.append(stim.target_rec(measurement_round_offset[0]+gauge_ind-self.code.n-measurements_per_cycle))
+                qubits_and_time = stabilizer.copy()
+                qubits_and_time.extend([self.T])
+                stim_circuits['0'].append("DETECTOR", record_targets, qubits_and_time)
+                stim_circuits['1'].append("DETECTOR", record_targets, qubits_and_time)
+            stim_circuits['0'].append("OBSERVABLE_INCLUDE",[stim.target_rec(q - self.code.n) for q in sorted(self.logical_x[0])],0)
+            stim_circuits['1'].append("OBSERVABLE_INCLUDE",[stim.target_rec(q - self.code.n) for q in sorted(self.logical_x[0])],0) 
+        else:
+            for stabind,stabilizer in enumerate(self.z_stabilizers):
+                record_targets = []
+                for q in stabilizer:
+                    record_targets.append(stim.target_rec(q - self.code.n))
+                for gauge_ind in self._gauges4stabilizers[1][stabind]:
+                    record_targets.append(stim.target_rec(measurement_round_offset[1]+gauge_ind-self.code.n-measurements_per_cycle))
+                qubits_and_time = stabilizer.copy()
+                qubits_and_time.extend([self.T])
+                stim_circuits['0'].append("DETECTOR", record_targets, qubits_and_time)
+                stim_circuits['1'].append("DETECTOR", record_targets, qubits_and_time)
+            stim_circuits['0'].append("OBSERVABLE_INCLUDE",[stim.target_rec(q - self.code.n) for q in sorted(self.logical_z[0])],0)
+            stim_circuits['1'].append("OBSERVABLE_INCLUDE",[stim.target_rec(q - self.code.n) for q in sorted(self.logical_z[0])],0)
+
+        return stim_circuits
+    
+    def _make_syndrome_graph(self):
+        stim_circuit = self.stim_circuit_with_detectors()['0']
+        e = stim_circuit.detector_error_model(decompose_errors=True, approximate_disjoint_errors=True)
+        graph, hyperedges = detector_error_model_to_rx_graph(e)
+        return graph, hyperedges
+    
