@@ -100,7 +100,7 @@ class CSSCodeCircuit(CodeCircuit):
                     self._x_gauge_measurements(qc, t, state)
                     self._z_gauge_measurements(qc, t, state)
                 else:
-                    print("Round schedule " + round_schedule + " not supported.")
+                    raise Exception("Round schedule " + round_schedule + " not supported.")
             # final readout
             creg = ClassicalRegister(code.n, name="final_readout")
             qc.add_register(creg)
