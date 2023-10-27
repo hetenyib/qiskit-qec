@@ -128,6 +128,8 @@ class CSSCodeCircuit(CodeCircuit):
                         gauges.append(g)
                 self._gauges4stabilizers[j].append(gauges)
 
+        self.detectors, self.logicals = self.stim_detectors()
+
     def _get_code_properties(self):
         if isinstance(self.code, StabSubSystemCode):
             is_css = True
@@ -255,7 +257,6 @@ class CSSCodeCircuit(CodeCircuit):
         Returns:
             a list of 'DecodingGraphNode()'-s corresponding to the triggered detectors
         """
-        self.detectors, self.logicals = self.stim_detectors()
 
         nodes = string2nodes_with_detectors(
             string=string,
