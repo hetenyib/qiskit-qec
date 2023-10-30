@@ -16,7 +16,7 @@
 
 """Tools to use functionality from Stim."""
 from typing import Union, List, Dict, Callable
-from math import loga
+from math import log as loga
 from stim import Circuit as StimCircuit
 from stim import DetectorErrorModel as StimDetectorErrorModel
 from stim import DemInstruction as StimDemInstruction
