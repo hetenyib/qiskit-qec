@@ -210,7 +210,7 @@ class StimCodeCircuit(CodeCircuit):
         # further code parameters
         try:
             self.d = len(self.stim_circuit.shortest_graphlike_error())  # code distance
-        except:
+        except ValueError:
             self.d = 0
         self.n = stim_circuit.num_qubits
         # the number of rounds is not necessarily well-defined (Floquet codes etc.)
