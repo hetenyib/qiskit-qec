@@ -16,7 +16,7 @@
 
 """Tools to use functionality from Stim."""
 from typing import Union, List, Dict, Callable
-from math import log
+from math import loga
 from stim import Circuit as StimCircuit
 from stim import DetectorErrorModel as StimDetectorErrorModel
 from stim import DemInstruction as StimDemInstruction
@@ -404,7 +404,7 @@ def detector_error_model_to_rx_graph(
             )
             edge = DecodingGraphEdge(
                 qubits=qubits,
-                weight=log((1 - p) / p),
+                weight=loga((1 - p) / p),
                 properties={"fault_ids": set(frame_changes), "error_probability": p},
             )
             g.add_edge(dets[0], dets[1], edge)
